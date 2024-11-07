@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) !void {
         },
     });
 
-    const draw2_module = b.addModule("way2", .{
+    const draw2_module = b.addModule("draw2", .{
         .root_source_file = b.path("src/draw2.zig"),
         .imports = &.{.{ .name = "type2", .module = type2_module }},
     });

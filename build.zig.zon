@@ -21,6 +21,7 @@
         "src/type2.zig",
         "src/way2.zig",
         "src/draw2.zig",
+        "scanner.py",
         "LICENSE",
     },
 }
