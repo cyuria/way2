@@ -1,0 +1,26 @@
+.{
+    .name = "way2",
+    .version = "0.1.0-dev",
+    .dependencies = .{
+        .@"wlr-protocols" = .{
+            .url = "git+https://gitlab.freedesktop.org/wlroots/wlr-protocols.git#ffb89ac790096f6e6272822c8d5df7d0cc6fcdfa",
+            .hash = "1220c1a9ba69386248817fa7ff7f87835df7320f02757b54682327054dce619541bb",
+        },
+        .@"wayland-protocols" = .{
+            .url = "git+https://gitlab.freedesktop.org/wayland/wayland-protocols.git#9dd051b4a0c6df82937d57d38ac7df389f16e6fa",
+            .hash = "12206f66669afcdfba2a09b59d4f7db22829115ff92a72cdf495296e4161dabf1166",
+        },
+        .wayland = .{
+            .url = "git+https://gitlab.freedesktop.org/wayland/wayland.git#f67db75ec118f6ec64e60113dbdecb20b4ea1abd",
+            .hash = "12202f905fed71db1b6b1d7a72d7c2ddc36cf1d4e0e219fb108587227f9bcd91809e",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src/type2.zig",
+        "src/way2.zig",
+        "src/draw2.zig",
+        "LICENSE",
+    },
+}
