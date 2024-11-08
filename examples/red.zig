@@ -31,7 +31,9 @@ pub fn main() !void {
         } });
 
         try window.present();
-
+        while (window.seat.poll()) |event| {
+            std.log.info("event {} received", .{event});
+        }
         try client.listen();
     }
 }

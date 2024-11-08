@@ -280,6 +280,8 @@ pub const Client = struct {
             => unreachable,
         };
         std.debug.assert(size == packet.len);
+
+        self.listen() catch |err| log.err("listen err {}", .{err});
     }
 
     /// Send a wayland message with an attached file descripter
@@ -371,6 +373,8 @@ pub const Client = struct {
             log.err("Unable to send bytes to wayland compositor", .{});
             return error.WaylandConnection;
         }
+
+        self.listen() catch |err| log.err("listen err {}", .{err});
     }
 
     /// Waits for, receives and handles a single wayland event
@@ -527,14 +531,13 @@ pub const Client = struct {
 
     /// Creates an object to store event handlers for the given interface
     fn createEventHandlers(interface: wl.Interface) wl.Events {
-        // Required for complex comptime syntax. Idk why backwards branching is
-        // needed here, but it is.
-        @setEvalBranchQuota(2000000);
         return switch (interface) {
             inline else => |i| @unionInit(
                 wl.Events,
                 @tagName(i),
-                std.meta.FieldType(wl.Events, i).initFill(null),
+                // Manually inline the std.meta.FieldType call because
+                // otherwise we need an eval branch quota of 2 million
+                std.meta.fields(wl.Events)[@intFromEnum(i)].type.initFill(null),
             ),
         };
     }
@@ -630,6 +633,7 @@ pub const Window = struct {
     };
 
     client: *Client,
+    seat: Seat,
     role: union(enum) {
         xdg: struct {
             wm_base: u32 = 0,
@@ -680,7 +684,10 @@ pub const Window = struct {
     pub fn init(
         client: *Client,
     ) Window {
-        return .{ .client = client };
+        return .{
+            .client = client,
+            .seat = Seat.init(client),
+        };
     }
 
     /// Opens a new wayland window
@@ -745,6 +752,13 @@ pub const Window = struct {
                     // TODO: properly document and rename xdg not supported error
                     return error.Unsupported;
                 };
+                self.client.setHandler(
+                    self.role.xdg.wm_base,
+                    .xdg_wm_base,
+                    .ping,
+                    self.client,
+                    pong,
+                );
                 try self.client.send(2, wayland.registry.rq{ .bind = .{
                     .id = self.role.xdg.wm_base,
                     .name = xdg_wm_base.name,
@@ -759,22 +773,9 @@ pub const Window = struct {
                         log.err("Error received while cleaning up {}", .{err});
                     };
                 }
-                self.client.setHandler(
-                    self.role.xdg.wm_base,
-                    .xdg_wm_base,
-                    .ping,
-                    self.client,
-                    pong,
-                );
 
                 log.debug("binding xdg_surface", .{});
                 self.role.xdg.surface = self.client.bind(.xdg_surface);
-                try self.client.send(self.role.xdg.wm_base, xdg_shell.wm_base.rq{
-                    .get_xdg_surface = .{
-                        .id = self.role.xdg.surface,
-                        .surface = self.wl.surface,
-                    },
-                });
                 self.client.setHandler(
                     self.role.xdg.surface,
                     .xdg_surface,
@@ -782,12 +783,15 @@ pub const Window = struct {
                     self,
                     xdgConfigure,
                 );
+                try self.client.send(self.role.xdg.wm_base, xdg_shell.wm_base.rq{
+                    .get_xdg_surface = .{
+                        .id = self.role.xdg.surface,
+                        .surface = self.wl.surface,
+                    },
+                });
 
                 log.debug("binding xdg_toplevel", .{});
                 self.role.xdg.toplevel = self.client.bind(.xdg_toplevel);
-                try self.client.send(self.role.xdg.surface, xdg_shell.surface.rq{
-                    .get_toplevel = .{ .id = self.role.xdg.toplevel },
-                });
                 self.client.setHandler(
                     self.role.xdg.toplevel,
                     .xdg_toplevel,
@@ -795,14 +799,12 @@ pub const Window = struct {
                     self,
                     toplevelConfigure,
                 );
+                try self.client.send(self.role.xdg.surface, xdg_shell.surface.rq{
+                    .get_toplevel = .{ .id = self.role.xdg.toplevel },
+                });
             },
             else => return error.Unimplemented,
         }
-
-        log.debug("committing wl_surface", .{});
-        try self.client.send(self.wl.surface, wayland.surface.rq{
-            .commit = .{},
-        });
 
         log.debug("binding wl_shm", .{});
         self.wl.shm = self.client.bind(.wl_shm);
@@ -848,6 +850,11 @@ pub const Window = struct {
 
         log.debug("creating wl_buffer", .{});
         self.wl.buffer = self.client.bind(.wl_buffer);
+        // TODO: correctly handle the wl_buffer::release event
+        // self.client.handlers.items[self.wl.buffer].wl_buffer.set(.release, .{
+        //     .context = null,
+        //     .call = @ptrCast(),
+        // });
         try self.client.send(self.wl.pool, wayland.shm_pool.rq{ .create_buffer = .{
             .id = self.wl.buffer,
             .offset = 0,
@@ -856,13 +863,41 @@ pub const Window = struct {
             .stride = @sizeOf(type2.Pixel),
             .format = @intFromEnum(wayland.shm.format.argb8888),
         } });
-        // TODO: correctly handle the wl_buffer::release event
-        // self.client.handlers.items[self.wl.buffer].wl_buffer.set(.release, .{
-        //     .context = null,
-        //     .call = @ptrCast(),
-        // });
+
+        {
+            const roundtrip_callback = self.client.bind(.wl_callback);
+            var roundtrip_done = false;
+            self.client.setHandler(roundtrip_callback, .wl_callback, .done, &roundtrip_done, roundTrip);
+            try self.client.send(Client.wl_display, wayland.display.rq{
+                .sync = .{ .callback = roundtrip_callback },
+            });
+
+            while (!roundtrip_done) try self.client.recv();
+            self.client.invalidate(roundtrip_callback);
+            try self.client.listen();
+        }
+
+        log.debug("committing wl_surface", .{});
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .commit = .{},
+        });
 
         try self.newFrame();
+
+        try self.seat.setup();
+
+        {
+            const roundtrip_callback = self.client.bind(.wl_callback);
+            var roundtrip_done = false;
+            self.client.setHandler(roundtrip_callback, .wl_callback, .done, &roundtrip_done, roundTrip);
+            try self.client.send(Client.wl_display, wayland.display.rq{
+                .sync = .{ .callback = roundtrip_callback },
+            });
+
+            while (!roundtrip_done) try self.client.recv();
+            self.client.invalidate(roundtrip_callback);
+            try self.client.listen();
+        }
     }
 
     /// Closes a wayland window
@@ -883,10 +918,8 @@ pub const Window = struct {
     pub fn present(
         self: *Window,
     ) !void {
-        while (!self.frame.time.done) {
-            std.time.sleep(1000);
-            try self.client.listen();
-        }
+        while (!self.frame.time.done) try self.client.recv();
+        try self.client.listen();
 
         self.client.invalidate(self.wl.frame_callback);
         try self.newFrame();
@@ -921,6 +954,18 @@ pub const Window = struct {
         try self.client.listen();
     }
 
+    fn roundTrip(
+        trigger: *bool,
+        object: u32,
+        opcode: wayland.callback.event,
+        body: []const u8,
+    ) void {
+        std.debug.assert(opcode == .done);
+        trigger.* = true;
+        _ = object;
+        _ = body;
+    }
+
     /// Wayland event handler for the xdg_shell wm_base pong event
     fn pong(
         client: *Client,
@@ -950,9 +995,12 @@ pub const Window = struct {
         self.buffer.resize(self.size[0] * self.size[1] * @sizeOf(type2.Pixel)) catch {
             log.err("unrecoverable IO error encountered", .{});
         };
+
         self.frame.buffer = FrameBuffer.init(&self.buffer, 0, self.size[0], self.size[1]);
         self.client.invalidate(self.wl.frame_callback);
         self.newFrame() catch log.err("unrecoverable wayland connection error", .{});
+
+        log.debug("pool {} frame_callback {}", .{ self.wl.pool, self.wl.frame_callback });
 
         self.client.send(self.wl.pool, wayland.shm_pool.rq{
             .resize = .{ .size = @intCast(self.buffer.pool.len) },
@@ -1116,6 +1164,7 @@ pub const Buffer = struct {
 
 /// Manages an event queue and related input devices
 pub const Seat = struct {
+    allocator: std.mem.Allocator,
     client: *Client,
     seat: u32,
     keyboard: u32,
@@ -1145,18 +1194,23 @@ pub const Seat = struct {
         close: struct {
             window: *Window,
         },
-        tmp: opaque {},
     };
 
     pub fn init(client: *Client) Seat {
         return .{
+            .allocator = client.allocator,
             .client = client,
             .seat = 0,
+            .keyboard = 0,
+            .pointer = 0,
+            .touch = 0,
+            .queue = std.DoublyLinkedList(Event){},
         };
     }
     pub fn setup(self: *Seat) !void {
         self.seat = self.client.bind(.wl_seat);
         errdefer self.client.invalidate(self.seat);
+        log.debug("binding wl_seat [{d}]", .{self.seat});
         const seat = self.client.globals.objects.get("wl_seat") orelse {
             return error.UnsupportedCompositor;
         };
@@ -1169,7 +1223,7 @@ pub const Seat = struct {
                 .id = self.seat,
                 .name = seat.name,
                 .version = seat.version,
-                .interface = seat.interface,
+                .interface = seat.string,
             } },
         );
         errdefer {
@@ -1180,8 +1234,13 @@ pub const Seat = struct {
                 log.err("Error received while cleaning up {}", .{err});
             };
         }
-
         self.client.setHandler(self.seat, .wl_seat, .capabilities, self, register);
+    }
+
+    pub fn poll(self: *Seat) ?Event {
+        const node = self.queue.popFirst() orelse return null;
+        defer self.allocator.destroy(node);
+        return node.data;
     }
 
     fn register(
@@ -1192,49 +1251,92 @@ pub const Seat = struct {
     ) void {
         std.debug.assert(object == self.seat);
         std.debug.assert(opcode == .capabilities);
-        const event = deserialiseStruct(wayland.seat.capability, body);
-        if (self.keyboard == 0 and event.keyboard) self.addKeyboard() catch {
+        const event = deserialiseStruct(wayland.seat.ev.capabilities, body);
+        const capabilities: wayland.seat.capability = @bitCast(event.capabilities);
+        log.debug(
+            "seat capabilities found [keyboard {}] [pointer {}] [touch {}]",
+            .{ capabilities.keyboard, capabilities.pointer, capabilities.touch },
+        );
+        if (self.keyboard == 0 and capabilities.keyboard) self.addKeyboard() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.keyboard != 0 and !event.keyboard) self.remKeyboard() catch {
+        if (self.keyboard != 0 and !capabilities.keyboard) self.remKeyboard() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.pointer == 0 and event.pointer) self.addPointer() catch {
+        if (self.pointer == 0 and capabilities.pointer) self.addPointer() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.pointer != 0 and !event.pointer) self.remPointer() catch {
+        if (self.pointer != 0 and !capabilities.pointer) self.remPointer() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.touch == 0 and event.touch) self.addTouch() catch {
+        if (self.touch == 0 and capabilities.touch) self.addTouch() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.touch != 0 and !event.touch) self.remTouch() catch {
+        if (self.touch != 0 and !capabilities.touch) self.remTouch() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
     }
 
-    fn addKeyboard(self: Seat) !void {
-        _ = self;
+    fn addKeyboard(self: *Seat) !void {
+        std.debug.assert(self.keyboard == 0);
+        self.keyboard = self.client.bind(.wl_keyboard);
+        errdefer {
+            self.client.invalidate(self.keyboard);
+            self.keyboard = 0;
+        }
+        try self.client.send(self.seat, wayland.seat.rq{
+            .get_keyboard = .{ .id = self.keyboard },
+        });
+        //self.client.setHandler(self.keyboard, .wl_keyboard, .keymap, self, setKeymap);
+        self.client.setHandler(self.keyboard, .wl_keyboard, .enter, self, kbdEvent);
+        self.client.setHandler(self.keyboard, .wl_keyboard, .leave, self, kbdEvent);
+        self.client.setHandler(self.keyboard, .wl_keyboard, .key, self, kbdEvent);
+        self.client.setHandler(self.keyboard, .wl_keyboard, .modifiers, self, kbdEvent);
+        self.client.setHandler(self.keyboard, .wl_keyboard, .repeat_info, self, kbdEvent);
     }
 
-    fn remKeyboard(self: Seat) !void {
-        _ = self;
+    fn remKeyboard(self: *Seat) !void {
+        _ = &self;
     }
 
-    fn addPointer(self: Seat) !void {
-        _ = self;
+    fn addPointer(self: *Seat) !void {
+        _ = &self;
     }
 
-    fn remPointer(self: Seat) !void {
-        _ = self;
+    fn remPointer(self: *Seat) !void {
+        _ = &self;
     }
 
-    fn addTouch(self: Seat) !void {
-        _ = self;
+    fn addTouch(self: *Seat) !void {
+        _ = &self;
     }
 
-    fn remTouch(self: Seat) !void {
-        _ = self;
+    fn remTouch(self: *Seat) !void {
+        _ = &self;
+    }
+
+    fn kbdEvent(
+        self: *Seat,
+        object: u32,
+        opcode: wayland.keyboard.event,
+        body: []const u8,
+    ) void {
+        std.debug.assert(object == self.keyboard);
+        const node = self.allocator.create(@TypeOf(self.queue).Node) catch @panic("Out of memory");
+        switch (opcode) {
+            .key => {
+                const event = deserialiseStruct(wayland.keyboard.ev.key, body);
+                node.data = .{ .key = .{
+                    .key = event.key,
+                    .state = @enumFromInt(event.state),
+                } };
+            },
+            .keymap => unreachable,
+            else => {
+                log.info("keyboard {s}", .{@tagName(opcode)});
+            },
+        }
+        self.queue.append(node);
     }
 };
 
