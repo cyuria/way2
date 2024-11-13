@@ -5,6 +5,8 @@ A python script to enumerate wayland protocol requests and events as zig source
 code.
 """
 
+from itertools import groupby
+from math import log2
 from pathlib import Path
 from re import match
 from subprocess import check_output
@@ -144,6 +146,9 @@ def rename(element: xml.Element, tree: xml.ElementTree) -> str:
         return f'{getNamespace(tree)}_{cut}'
     return cut
 
+def renameEnum(name: str) -> str:
+    return ''.join(word.title() for word in name.split('_'))
+
 def zigFormat(source: str) -> str:
     return check_output(['zig', 'fmt', '--stdin'], input=source, text=True)
 
@@ -161,7 +166,6 @@ def genInterfaceEnum(trees: Iterable[xml.ElementTree]) -> str:
             f'{interface.attrib['name']},'
             for tree in trees
             for interface in tree.iter('interface')
-            if tree.getroot().tag == 'protocol'
         ) }
     }};""")
 
@@ -173,7 +177,6 @@ def genMap(trees: Iterable[xml.ElementTree]) -> str:
             f'.{interface.attrib['name']} = {getEvent(interface, tree)},'
             for tree in trees
             for interface in tree.iter('interface')
-            if tree.getroot().tag == 'protocol'
         ) }
     }});
     """
@@ -192,7 +195,6 @@ def genEvents(trees: Iterable[xml.ElementTree]) -> str:
             ),"""
             for tree in trees
             for interface in tree.iter('interface')
-            if tree.getroot().tag == 'protocol'
         ) }
     }};
     """
@@ -202,6 +204,9 @@ def genProtoZig(protocols: Iterable[xml.ElementTree]) -> str:
         pub const std = @import("std");
 
         {genImportAll(protocols)}
+
+        pub const types = @import("types.zig");
+
         {genInterfaceEnum(protocols)}
         {genMap(protocols)}
         {genEvents(protocols)}
@@ -213,47 +218,59 @@ def genTypesZig() -> str:
         pub const Array = []const u32;
     """)
 
-def findEnumDefinition(definition: str, interface: xml.Element) -> tuple[xml.ElementTree | None, xml.Element, xml.Element]:
-    if len(definition.split('.')) > 1:
+def findEnumDefinition(
+    definition: str,
+    current_interface: xml.Element,
+    current_tree: xml.ElementTree
+) -> tuple[xml.ElementTree | None, xml.Element | None, xml.Element]:
+    try:
+        if '.' not in definition:
+            return next(
+                (None, None, enum)
+                for enum in current_interface.iter('enum')
+                if enum.attrib['name'] == definition
+            )
+
+        interface_name, enum_name = definition.split('.')
         try:
-            tree, interface = next(
-                (tree, interface)
-                for tree in trees
-                if tree.getroot().tag == 'protocol'
-                for interface in tree.iter('interface')
-                if interface.attrib['name'] == definition.split('.')[-2]
+            return next(
+                (None, interface, enum)
+                for interface in current_tree.iter('interface')
+                if interface.attrib['name'] == interface_name
+                for enum in interface.iter('enum')
+                if enum.attrib['name'] == enum_name
             )
         except StopIteration:
-            print(f"scan2.py: fatal: Unable to find definition for {definition}", file=stderr)
-            exit(1)
-    else:
-        tree, interface = None, interface
-
-    try:
-        return tree, interface, next(
-            enum for enum in interface.iter('enum')
-            if enum.attrib['name'] == definition.split('.')[-1]
-        )
+            return next(
+                (tree, interface, enum)
+                for tree in trees
+                for interface in tree.iter('interface')
+                if interface.attrib['name'] == interface_name
+                for enum in interface.iter('enum')
+                if enum.attrib['name'] == enum_name
+            )
     except StopIteration:
         print(f"scan2.py: fatal: Unable to find definition for {definition}", file=stderr)
         exit(1)
 
 def genSingleArgument(argument: xml.Element, interface: xml.Element, tree: xml.ElementTree) -> str:
-    name = rename(argument, tree)
-    tp = argument.attrib['type']
-    if tp == "fd":
+    if argument.attrib['type'] == "fd":
         return ''
-    if tp == "uint" and 'enum' in argument.attrib:
-        enum_tree, interface, enum = findEnumDefinition(argument.attrib['enum'], interface)
-        fetch = f'@import({enum_tree.getroot().attrib['name']}.zig)' if enum_tree else ''
-        return f"{name}: {fetch}.{rename(interface, enum_tree or tree)}.{rename(enum, enum_tree or tree)},"
-    if tp == "new_id" and "interface" not in argument.attrib:
+
+    if argument.attrib['type'] == "uint" and 'enum' in argument.attrib:
+        enum_tree, enum_interface, enum = findEnumDefinition(argument.attrib['enum'], interface, tree)
+        tree_decl = f'@import("{enum_tree.getroot().attrib['name']}.zig").' if enum_tree is not None else ''
+        interface_decl = f'{rename(enum_interface, enum_tree or tree)}.' if enum_interface is not None else ''
+        return f"{rename(argument, tree)}: {tree_decl}{interface_decl}{renameEnum(enum.attrib['name'])},"
+
+    if argument.attrib['type'] == "new_id" and "interface" not in argument.attrib:
         return f"""
             interface: {type_mapping['string']},
             version: {type_mapping['uint']},
-            {name}: {type_mapping[tp]},
+            {rename(argument, tree)}: {type_mapping[argument.attrib['type']]},
         """
-    return f"{name}: {type_mapping[tp]},"
+
+    return f"{rename(argument, tree)}: {type_mapping[argument.attrib['type']]},"
 
 def genSingleRequest(request: xml.Element, interface: xml.Element, tree: xml.ElementTree) -> str:
     return f"""
@@ -271,6 +288,41 @@ def genSingleEvent(event: xml.Element, interface: xml.Element, tree: xml.Element
             { '\n'.join(
                 genSingleArgument(argument, interface, tree)
                 for argument in event.iter('arg')
+            ) }
+        }};
+    """
+
+def genSingleBitfield(bitfield: xml.Element, tree: xml.ElementTree) -> str:
+    entries = [
+        (rename(entry, tree), int(log2(int(entry.attrib['value'], 0))))
+        for entry in bitfield.iter('entry')
+        # Filter out non powers of two. This removes stupid entries
+        if int(entry.attrib['value'], 0) & (int(entry.attrib['value'], 0) - 1) == 0 and 
+            int(entry.attrib['value'], 0) > 0
+    ]
+    entries.sort(key=lambda pair: pair[1])
+
+    return f"""
+        pub const {renameEnum(bitfield.attrib['name'])} = packed struct(u32) {{
+            { '\n'.join(
+                f'{name}: bool,' if name != '_' else f'_: u{sum(1 for _ in group)},'
+                for name, group in
+                groupby(
+                    next((entry[0] for entry in entries if entry[1] == i), '_')
+                    for i in range(32)
+                )
+            ) }
+        }};
+    """
+
+def genSingleEnum(enum: xml.Element, tree: xml.ElementTree) -> str:
+    if 'bitfield' in enum.attrib and enum.attrib['bitfield'] == 'true':
+        return genSingleBitfield(enum, tree)
+    return f"""
+        pub const {renameEnum(enum.attrib['name'])} = enum (u32) {{
+            { '\n'.join(
+                f'{rename(entry, tree)} = {entry.attrib['value']},'
+                for entry in enum.iter('entry')
             ) }
         }};
     """
@@ -305,16 +357,13 @@ def genSingleInterface(interface: xml.Element, tree: xml.ElementTree) -> str:
                     for event in interface.iter('event')
                 ) }
             }};
+
+            { '\n'.join(
+                genSingleEnum(enum, tree)
+                for enum in interface.iter('enum')
+            ) }
         }};
     """
-    #{{ '\n'.join(
-    #    f'pub const {{
-    #        initCaps(rename(e.attrib['name'], namespace))
-    #    }} = {{
-    #        enum(e, namespace)
-    #    }};'
-    #    for e in element.iter('enum')
-    #) }}
 
 def genSingleZig(tree: xml.ElementTree) -> str:
     return zigFormat(f"""
@@ -354,77 +403,16 @@ def main(output, args):
 
     global trees
     trees = [xml.parse(file) for file in files]
+    trees = [tree for tree in trees if tree.getroot().tag == 'protocol']
 
-    #with open(destination / 'proto.zig') as f:
-    #f.write(
-    #print(genProtoZig(trees))
-    #)
+    with open(destination / 'types.zig', 'w') as f:
+        f.write(genTypesZig())
+    with open(destination / 'proto.zig', 'w') as f:
+        f.write(genProtoZig(trees))
 
     for tree in trees:
-        print(genSingleZig(tree))
-
-    """
-    for file in files:
-        tree = ET.parse(file)
-
-        root = tree.getroot()
-        try:
-            proto, namespace = protocol(root)
-        except Exception as e:
-            print(f"Error: Invalid wayland file - {e}")
-            continue
-
-        output = destination / f"{root.attrib['name']}.zig"
-        with open(output, 'w') as f:
-            f.write(zigFormat(proto))
-
-        interfaces += [
-            (root.attrib['name'], namespace, i.attrib['name'])
-            for i in root
-            if i.tag == 'interface' and
-                i.attrib['name'] not in deprecated
-        ]
-
-    fnptr = '?struct { context: *anyopaque, call: *const fn (*anyopaque, u32, enum {}, []const u8) void, },'
-    types = destination / 'types.zig'
-    index = destination / 'proto.zig'
-    with types.open('w') as f:
-        f.write(zigFormat(definitions));
-    # ```    wl_display: std.EnumArray(wayland.display.event, *const fn (u32) void),```
-    with index.open('w') as f:
-        f.write(zigFormat(f"" "
-            const std = @import("std");
-
-            { '\n'.join(
-                f'pub const {f} = @import("{f}.zig");'
-                for f in { f for f, _, _ in interfaces }
-            ) }
-
-            pub const types = @import("types.zig");
-
-            pub const Interface = enum {{
-                invalid,
-                { '\n'.join(f'{i},' for _, _, i in interfaces) }
-            }};
-
-            pub const map = std.EnumArray(Interface, type).init(.{{
-                .invalid = enum {{}},
-                { '\n'.join(
-                    f'.{i} = {f}.{i.removeprefix(f'{n}_') if n else i}.event,'
-                    for f, n, i in interfaces)
-                }
-            }});
-
-            pub const Events = union(Interface) {{
-                invalid: std.EnumArray(enum {{}}, {fnptr}),
-                { '\n'.join(
-                    f'{i}: {handler(f, n, i, 'event')}'
-                    for f, n, i in interfaces
-                ) }
-            }};
-        " ""))
-
-    """
+        with open(destination / f'{tree.getroot().attrib['name']}.zig', 'w') as f:
+            f.write(genSingleZig(tree))
 
 if __name__ == "__main__":
     main(argv[1], argv[2:])
