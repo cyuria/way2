@@ -27,93 +27,34 @@ type_mapping = {
 }
 
 deprecated_interfaces = [
-    "wl_shell",
-    "wl_shell_surface",
+    "wl_shell", "wl_shell_surface",
 ]
 
 disallowed_words = {
-    "addrspace",
-    "align",
-    "allowzero",
-    "and",
-    "anyframe",
-    "anytype",
-    "asm",
-    "async",
-    "await",
-    "break",
-    "callconv",
-    "catch",
-    "comptime",
-    "const",
-    "continue",
-    "defer",
-    "else",
-    "enum",
-    "errdefer",
-    "error",
-    "export",
-    "extern",
-    "fn",
-    "for",
-    "if",
-    "inline",
-    "linksection",
-    "noalias",
-    "noinline",
-    "nosuspend",
-    "opaque",
-    "or",
-    "orelse",
-    "packed",
-    "pub",
-    "resume",
-    "return",
-    "struct",
-    "suspend",
-    "switch",
-    "test",
-    "threadlocal",
-    "try",
-    "union",
-    "unreachable",
-    "usingnamespace",
-    "var",
-    "volatile",
+    "addrspace",   "align",          "allowzero",   "and",
+    "anyframe",    "anytype",        "asm",         "async",
+    "await",       "break",          "callconv",    "catch",
+    "comptime",    "const",          "continue",    "defer",
+    "else",        "enum",           "errdefer",    "error",
+    "export",      "extern",         "fn",          "for",
+    "if",          "inline",         "linksection", "noalias",
+    "noinline",    "nosuspend",      "opaque",      "or",
+    "orelse",      "packed",         "pub",         "resume",
+    "return",      "struct",         "suspend",     "switch",
+    "test",        "threadlocal",    "try",         "union",
+    "unreachable", "usingnamespace", "var",         "volatile",
     "while",
 }.union({
-    "isize",
-    "usize",
-    "c_char",
-    "c_short",
-    "c_ushort",
-    "c_int",
-    "c_uint",
-    "c_long",
-    "c_ulong",
-    "c_longlong",
-    "c_ulonglong",
-    "c_longdouble",
-    "f16",
-    "f32",
-    "f64",
-    "f80",
-    "f128",
-    "bool",
-    "anyopaque",
-    "void",
-    "noreturn",
-    "type",
-    "anyerror",
-    "comptime_int",
+    "isize",    "usize",      "c_char",      "c_short",
+    "c_ushort", "c_int",      "c_uint",      "c_long",
+    "c_ulong",  "c_longlong", "c_ulonglong", "c_longdouble",
+    "f16",      "f32",        "f64",         "f80",
+    "f128",     "bool",       "anyopaque",   "void",
+    "noreturn", "type",       "anyerror",    "comptime_int",
     "comptime_float",
 }).union({
-    "std",
-    "types",
-    "true",
-    "false",
-    "null",
-    "undefined",
+    "std",  "types", "true", "false",
+    "null", "undefined",
 })
 
 def isAllowed(word: str) -> bool:
@@ -126,10 +67,8 @@ def isAllowed(word: str) -> bool:
     return True
 
 def getNamespace(tree: xml.ElementTree) -> str:
-    try:
-        next(tree.iter('interface'))
-    except StopIteration:
-        return ""
+    if next(tree.iter('interface'), None) is None:
+        return ''
 
     for i, letters in enumerate(zip(*(i.attrib['name'] for i in tree.iter('interface')))):
         if len(set(letters)) > 1:
@@ -293,24 +232,16 @@ def genSingleEvent(event: xml.Element, interface: xml.Element, tree: xml.Element
     """
 
 def genSingleBitfield(bitfield: xml.Element, tree: xml.ElementTree) -> str:
-    entries = [
-        (rename(entry, tree), int(log2(int(entry.attrib['value'], 0))))
-        for entry in bitfield.iter('entry')
-        # Filter out non powers of two. This removes stupid entries
-        if int(entry.attrib['value'], 0) & (int(entry.attrib['value'], 0) - 1) == 0 and 
-            int(entry.attrib['value'], 0) > 0
-    ]
-    entries.sort(key=lambda pair: pair[1])
-
     return f"""
         pub const {renameEnum(bitfield.attrib['name'])} = packed struct(u32) {{
             { '\n'.join(
                 f'{name}: bool,' if name != '_' else f'_: u{sum(1 for _ in group)},'
-                for name, group in
-                groupby(
-                    next((entry[0] for entry in entries if entry[1] == i), '_')
-                    for i in range(32)
-                )
+                for name, group in groupby(next((
+                    rename(entry, tree)
+                    for entry in bitfield.iter('entry')
+                    if int(entry.attrib['value'], 0) > 0 and
+                        log2(int(entry.attrib['value'], 0)) == i
+                ), '_') for i in range(32))
             ) }
         }};
     """
@@ -369,9 +300,8 @@ def genSingleZig(tree: xml.ElementTree) -> str:
     return zigFormat(f"""
         { '\n'.join(
             f'// {line.strip()}'.strip()
-            for e in tree.iter('copyright')
-            if e.text
-            for line in (*e.text.split('\n'), '')
+            for e in tree.iter('copyright') if e.text
+            for line in e.text.split('\n')
         ) }
 
         const types = @import("types.zig");
