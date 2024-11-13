@@ -8,13 +8,13 @@ pub fn build(b: *std.Build) !void {
     const wayland_protocols_dep = b.dependency("wayland-protocols", .{});
     const wlr_protocols_dep = b.dependency("wlr-protocols", .{});
 
-    const protocol_step = b.step("protocols", "Generate wayland protocol binding code using ./scanner.py");
+    const protocol_step = b.step("protocols", "Generate wayland protocol binding code using ./scan2.py");
 
     const protocols = b.addSystemCommand(&.{
         "/usr/bin/env",
         "python3",
     });
-    protocols.addFileArg(b.path("scanner.py"));
+    protocols.addFileArg(b.path("scan2.py"));
     const protocol_dir = protocols.addOutputDirectoryArg("protocols/");
     protocols.addDirectoryArg(wayland_dep.path("protocol"));
     protocols.addDirectoryArg(wayland_protocols_dep.path("."));

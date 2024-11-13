@@ -861,7 +861,7 @@ pub const Window = struct {
             .width = 1,
             .height = 1,
             .stride = @sizeOf(type2.Pixel),
-            .format = @intFromEnum(wayland.shm.format.argb8888),
+            .format = wayland.shm.Format.argb8888,
         } });
 
         {
@@ -1019,7 +1019,7 @@ pub const Window = struct {
             .width = @intCast(self.frame.buffer.surface.width),
             .height = @intCast(self.frame.buffer.surface.height),
             .stride = @intCast(@sizeOf(type2.Pixel) * self.frame.buffer.surface.width),
-            .format = @intFromEnum(wayland.shm.format.argb8888),
+            .format = wayland.shm.Format.argb8888,
         } }) catch log.err("unrecoverable wayland connection error", .{});
 
         log.debug("attaching wl_buffer to wl_surface", .{});
@@ -1179,7 +1179,7 @@ pub const Seat = struct {
         },
         key: struct {
             key: u32,
-            state: wayland.keyboard.key_state,
+            state: wayland.keyboard.KeyState,
         },
         modifier: struct {
             depressed: u32,
@@ -1252,27 +1252,26 @@ pub const Seat = struct {
         std.debug.assert(object == self.seat);
         std.debug.assert(opcode == .capabilities);
         const event = deserialiseStruct(wayland.seat.ev.capabilities, body);
-        const capabilities: wayland.seat.capability = @bitCast(event.capabilities);
         log.debug(
             "seat capabilities found [keyboard {}] [pointer {}] [touch {}]",
-            .{ capabilities.keyboard, capabilities.pointer, capabilities.touch },
+            .{ event.capabilities.keyboard, event.capabilities.pointer, event.capabilities.touch },
         );
-        if (self.keyboard == 0 and capabilities.keyboard) self.addKeyboard() catch {
+        if (self.keyboard == 0 and event.capabilities.keyboard) self.addKeyboard() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.keyboard != 0 and !capabilities.keyboard) self.remKeyboard() catch {
+        if (self.keyboard != 0 and !event.capabilities.keyboard) self.remKeyboard() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.pointer == 0 and capabilities.pointer) self.addPointer() catch {
+        if (self.pointer == 0 and event.capabilities.pointer) self.addPointer() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.pointer != 0 and !capabilities.pointer) self.remPointer() catch {
+        if (self.pointer != 0 and !event.capabilities.pointer) self.remPointer() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.touch == 0 and capabilities.touch) self.addTouch() catch {
+        if (self.touch == 0 and event.capabilities.touch) self.addTouch() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
-        if (self.touch != 0 and !capabilities.touch) self.remTouch() catch {
+        if (self.touch != 0 and !event.capabilities.touch) self.remTouch() catch {
             log.err("unrecoverable Wayland Connection Error", .{});
         };
     }
@@ -1328,7 +1327,7 @@ pub const Seat = struct {
                 const event = deserialiseStruct(wayland.keyboard.ev.key, body);
                 node.data = .{ .key = .{
                     .key = event.key,
-                    .state = @enumFromInt(event.state),
+                    .state = event.state,
                 } };
             },
             .keymap => unreachable,
@@ -1371,15 +1370,22 @@ fn serialiseStruct(allocator: std.mem.Allocator, payload: anytype) []u8 {
                 writer.writeInt(u32, @intCast(component.len * 4), endian) catch @panic("Out of memory");
                 writer.writeAll(std.mem.sliceAsBytes(component)) catch @panic("Out of memory");
             },
-            i32, u32 => {
-                writer.writeInt(field.type, component, endian) catch @panic("Out of memory");
+            i32, u32 => |T| {
+                writer.writeInt(T, component, endian) catch @panic("Out of memory");
             },
             f64 => {
                 const fixed: i32 = @intFromFloat(component * 256.0);
                 writer.writeInt(@TypeOf(fixed), fixed, endian) catch @panic("Out of memory");
             },
-            else => |tp| {
-                @compileError("Cannot serialise unknown type " ++ tp.name);
+            else => |T| {
+                if (@bitSizeOf(T) != 32) {
+                    @compileError("Cannot serialise unknown type " ++ @typeName(T));
+                }
+                writer.writeInt(u32, switch (@typeInfo(T)) {
+                    .@"enum" => @intFromEnum(component),
+                    .@"struct" => @bitCast(component),
+                    else => @compileError("Cannot serialise unknown type " ++ @typeName(T)),
+                }, endian) catch @panic("Out of memory");
             },
         }
     }
@@ -1387,11 +1393,11 @@ fn serialiseStruct(allocator: std.mem.Allocator, payload: anytype) []u8 {
 }
 
 /// Deserialises a buffer into the provided type
-fn deserialiseStruct(T: type, buffer: []const u8) T {
+fn deserialiseStruct(ResultType: type, buffer: []const u8) ResultType {
     var stream = std.io.fixedBufferStream(buffer);
     const reader = stream.reader();
-    var args: T = undefined;
-    inline for (std.meta.fields(T)) |field| {
+    var args: ResultType = undefined;
+    inline for (std.meta.fields(ResultType)) |field| {
         const component = &@field(args, field.name);
         switch (field.type) {
             wl.types.String => {
@@ -1412,15 +1418,20 @@ fn deserialiseStruct(T: type, buffer: []const u8) T {
                 stream.pos += length;
                 if (stream.pos > stream.buffer.len) @panic("Invalid message received");
             },
-            i32, u32 => component.* = reader.readInt(
-                field.type,
-                endian,
-            ) catch unreachable,
+            i32, u32 => |T| component.* = reader.readInt(T, endian) catch unreachable,
             f64 => component.* = @as(f64, @floatFromInt(
                 reader.readInt(i32, endian) catch unreachable,
             )) / 256.0,
-            else => |tp| {
-                @compileError("Cannot deserialise unknown type " ++ tp.name);
+            else => |T| {
+                if (@bitSizeOf(T) != 32) {
+                    @compileError("Cannot deserialise unknown type " ++ @typeName(T));
+                }
+                const bytes = reader.readInt(u32, endian) catch @panic("Out of memory");
+                component.* = switch (@typeInfo(T)) {
+                    .@"enum" => @enumFromInt(bytes),
+                    .@"struct" => @bitCast(bytes),
+                    else => @compileError("Cannot deserialise unknown type " ++ @typeName(T)),
+                };
             },
         }
     }
